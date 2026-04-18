@@ -1,16 +1,117 @@
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::ops::Range;
 
-/// Render Markdown text into a flat sequence of styled lines suitable for
-/// preview display. Block-level source-range tracking will land with M4
-/// when per-block inline mode switching needs it.
-pub fn render(markdown: &str) -> Vec<Line<'static>> {
+/// A top-level Markdown block with its pre-rendered styled lines.
+///
+/// Blocks are the unit of raw-vs-styled mode switching: when the cursor (or
+/// an active selection) sits inside a block's `source_bytes`, the renderer
+/// shows that block as raw source; otherwise it uses `rendered_lines`.
+pub struct Block {
+    // id is unused in M4 but carried through for M6/M8 bitmap and plugin caching.
+    #[allow(dead_code)]
+    pub id: u64,
+    pub source_bytes: Range<usize>,
+    pub rendered_lines: Vec<Line<'static>>,
+}
+
+pub fn render(markdown: &str) -> Vec<Block> {
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS;
-    let parser = Parser::new_ext(markdown, opts);
+    let events: Vec<(Event<'_>, Range<usize>)> =
+        Parser::new_ext(markdown, opts).into_offset_iter().collect();
 
+    let mut blocks = Vec::new();
+    let mut next_id = 0u64;
+    let mut i = 0;
+    while i < events.len() {
+        if let Some(end_idx) = find_block_end(&events, i) {
+            let start_byte = events[i].1.start;
+            let end_byte = events[end_idx].1.end;
+            let slice: Vec<(Event<'_>, Range<usize>)> = events[i..=end_idx].to_vec();
+            let rendered = render_events(slice);
+            blocks.push(Block {
+                id: next_id,
+                source_bytes: start_byte..end_byte,
+                rendered_lines: rendered,
+            });
+            next_id += 1;
+            i = end_idx + 1;
+        } else {
+            if matches!(events[i].0, Event::Rule) {
+                blocks.push(Block {
+                    id: next_id,
+                    source_bytes: events[i].1.clone(),
+                    rendered_lines: vec![Line::from(Span::styled(
+                        "─".repeat(60),
+                        Style::default().fg(Color::DarkGray),
+                    ))],
+                });
+                next_id += 1;
+            }
+            i += 1;
+        }
+    }
+    blocks
+}
+
+fn find_block_end(events: &[(Event<'_>, Range<usize>)], start: usize) -> Option<usize> {
+    let Event::Start(tag) = &events[start].0 else {
+        return None;
+    };
+    if !is_block_tag(tag) {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut i = start + 1;
+    while i < events.len() {
+        match &events[i].0 {
+            Event::Start(t) if is_block_tag(t) => depth += 1,
+            Event::End(te) if is_block_tag_end(te) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_block_tag(tag: &Tag) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::Table(_)
+    )
+}
+
+fn is_block_tag_end(te: &TagEnd) -> bool {
+    matches!(
+        te,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::FootnoteDefinition
+            | TagEnd::Table
+    )
+}
+
+/// Render a single top-level block's events into styled lines.
+fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default()];
@@ -30,7 +131,7 @@ pub fn render(markdown: &str) -> Vec<Line<'static>> {
         out.push(Line::from(spans));
     };
 
-    for event in parser {
+    for (event, _range) in events {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -41,12 +142,10 @@ pub fn render(markdown: &str) -> Vec<Line<'static>> {
                     current.push(Span::styled(format!("{marker} "), style));
                 }
                 Tag::Paragraph => {}
-                Tag::BlockQuote(_) => {
-                    line_prefix.push(Span::styled(
-                        "│ ",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
+                Tag::BlockQuote(_) => line_prefix.push(Span::styled(
+                    "│ ",
+                    Style::default().fg(Color::DarkGray),
+                )),
                 Tag::CodeBlock(kind) => {
                     flush(&mut current, &line_prefix, &mut out);
                     in_code_block = true;
@@ -97,23 +196,19 @@ pub fn render(markdown: &str) -> Vec<Line<'static>> {
                     let base = *style_stack.last().unwrap();
                     style_stack.push(base.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED));
                 }
-                Tag::Image { dest_url, .. } => {
-                    current.push(Span::styled(
-                        format!("[image: {dest_url}]"),
-                        Style::default().fg(Color::Magenta),
-                    ));
-                }
+                Tag::Image { dest_url, .. } => current.push(Span::styled(
+                    format!("[image: {dest_url}]"),
+                    Style::default().fg(Color::Magenta),
+                )),
                 _ => {}
             },
             Event::End(tag_end) => match tag_end {
                 TagEnd::Heading(_) => {
                     style_stack.pop();
                     flush(&mut current, &line_prefix, &mut out);
-                    out.push(Line::raw(""));
                 }
                 TagEnd::Paragraph => {
                     flush(&mut current, &line_prefix, &mut out);
-                    out.push(Line::raw(""));
                 }
                 TagEnd::BlockQuote(_) => {
                     line_prefix.pop();
@@ -125,7 +220,6 @@ pub fn render(markdown: &str) -> Vec<Line<'static>> {
                         "──────────────────────────",
                         Style::default().fg(Color::DarkGray),
                     )));
-                    out.push(Line::raw(""));
                 }
                 TagEnd::List(_) => {
                     list_stack.pop();
@@ -164,36 +258,18 @@ pub fn render(markdown: &str) -> Vec<Line<'static>> {
                     current.push(Span::styled(t.into_string(), style));
                 }
             }
-            Event::Code(c) => {
-                current.push(Span::styled(
-                    c.into_string(),
-                    Style::default().fg(Color::LightYellow),
-                ));
-            }
+            Event::Code(c) => current.push(Span::styled(
+                c.into_string(),
+                Style::default().fg(Color::LightYellow),
+            )),
             Event::SoftBreak => current.push(Span::raw(" ")),
             Event::HardBreak => flush(&mut current, &line_prefix, &mut out),
-            Event::Rule => {
-                flush(&mut current, &line_prefix, &mut out);
-                out.push(Line::from(Span::styled(
-                    "─".repeat(60),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                out.push(Line::raw(""));
-            }
             _ => {}
         }
     }
 
     flush(&mut current, &line_prefix, &mut out);
-    // Trim trailing blank lines so scroll bounds are tighter.
-    while matches!(out.last(), Some(line) if line_is_blank(line)) {
-        out.pop();
-    }
     out
-}
-
-fn line_is_blank(line: &Line<'_>) -> bool {
-    line.spans.iter().all(|s| s.content.trim().is_empty())
 }
 
 enum ListKind {

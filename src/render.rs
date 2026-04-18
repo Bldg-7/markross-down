@@ -19,15 +19,13 @@ pub fn draw(editor: &mut Editor, frame: &mut Frame) {
 
     match editor.mode {
         RenderMode::Raw => {
-            editor.scroll_to_cursor();
+            editor.scroll_to_cursor_raw();
             draw_raw(editor, frame, content);
+            place_cursor_raw(editor, frame, content);
         }
         RenderMode::Preview => draw_preview(editor, frame, content),
     }
     draw_status(editor, frame, status);
-    if matches!(editor.mode, RenderMode::Raw) {
-        place_cursor(editor, frame, content);
-    }
 }
 
 fn draw_raw(editor: &Editor, frame: &mut Frame, area: Rect) {
@@ -96,11 +94,36 @@ fn draw_raw(editor: &Editor, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_preview(editor: &mut Editor, frame: &mut Frame, area: Rect) {
-    let top = editor.preview_top;
     let h = area.height as usize;
-    let preview = editor.preview_lines();
-    let slice: Vec<Line> = preview.iter().skip(top).take(h).cloned().collect();
+    let layout = editor.preview_layout();
+    let total = layout.lines.len();
+
+    // Keep the cursor's rendered row in view.
+    if layout.cursor_rendered_line < editor.preview_top {
+        editor.preview_top = layout.cursor_rendered_line;
+    } else if layout.cursor_rendered_line >= editor.preview_top + h && h > 0 {
+        editor.preview_top = layout.cursor_rendered_line + 1 - h;
+    }
+    let max_top = total.saturating_sub(h);
+    editor.preview_top = editor.preview_top.min(max_top);
+
+    let slice: Vec<Line> = layout
+        .lines
+        .iter()
+        .skip(editor.preview_top)
+        .take(h)
+        .cloned()
+        .collect();
     frame.render_widget(Paragraph::new(slice), area);
+
+    // Place cursor if it falls into the visible range.
+    let rel = layout.cursor_rendered_line as isize - editor.preview_top as isize;
+    if rel >= 0 && (rel as usize) < h {
+        let dc = editor.cursor_display_col();
+        if dc < area.width as usize {
+            frame.set_cursor_position((area.x + dc as u16, area.y + rel as u16));
+        }
+    }
 }
 
 fn draw_status(editor: &Editor, frame: &mut Frame, area: Rect) {
@@ -110,10 +133,7 @@ fn draw_status(editor: &Editor, frame: &mut Frame, area: Rect) {
         RenderMode::Raw => "RAW",
         RenderMode::Preview => "PREVIEW",
     };
-    let pos = match editor.mode {
-        RenderMode::Raw => format!("{}:{}", editor.cursor.line + 1, editor.cursor.col + 1),
-        RenderMode::Preview => format!("line {}", editor.preview_top + 1),
-    };
+    let pos = format!("{}:{}", editor.cursor.line + 1, editor.cursor.col + 1);
     let status_text = editor.status.as_deref().unwrap_or("");
     let left = format!(" [{mode_label}] {dirty_marker} {name}  {status_text}");
     let right = format!(" {pos} ");
@@ -125,7 +145,7 @@ fn draw_status(editor: &Editor, frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn place_cursor(editor: &Editor, frame: &mut Frame, area: Rect) {
+fn place_cursor_raw(editor: &Editor, frame: &mut Frame, area: Rect) {
     let rel_line = editor.cursor.line.saturating_sub(editor.viewport_top);
     if rel_line >= area.height as usize {
         return;

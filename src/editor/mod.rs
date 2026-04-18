@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::clipboard;
 use crate::document::{line_len_no_newline, Document};
-use crate::parser;
+use crate::parser::{self, Block};
 use cursor::Cursor;
 use input::{Action, Move};
 
@@ -22,7 +22,6 @@ pub enum RenderMode {
 pub struct Editor {
     pub document: Document,
     pub cursor: Cursor,
-    /// Character offset where Shift- or mouse-anchored selection started.
     pub selection_anchor: Option<usize>,
     pub viewport_top: usize,
     pub viewport_left: usize,
@@ -32,13 +31,22 @@ pub struct Editor {
     pub content_area: Rect,
     pub status: Option<String>,
     pub mode: RenderMode,
-    preview_cache: Option<Vec<Line<'static>>>,
+    preview_cache: Option<Vec<Block>>,
 }
 
 pub enum ActionOutcome {
     Continue,
     Saved,
     Quit,
+}
+
+/// Flattened preview output for one frame, produced by `Editor::preview_layout`.
+/// `cursor_rendered_line` is the row within `lines` that currently contains
+/// the cursor; it is always valid because the cursor's block is always
+/// displayed as raw (so source lines map 1:1 inside it).
+pub struct PreviewLayout {
+    pub lines: Vec<Line<'static>>,
+    pub cursor_rendered_line: usize,
 }
 
 impl Editor {
@@ -73,45 +81,24 @@ impl Editor {
         }
     }
 
+    fn selection_line_range(&self) -> Option<Range<usize>> {
+        let range = self.selection_range()?;
+        let rope = &self.document.rope;
+        let start_line = rope.char_to_line(range.start);
+        let end_line = rope.char_to_line(range.end);
+        Some(start_line..(end_line + 1))
+    }
+
     pub fn apply(&mut self, action: Action) -> Result<ActionOutcome> {
         self.status = None;
         if let Action::TogglePreview = action {
-            self.toggle_mode();
+            self.mode = match self.mode {
+                RenderMode::Raw => RenderMode::Preview,
+                RenderMode::Preview => RenderMode::Raw,
+            };
             return Ok(ActionOutcome::Continue);
         }
-        if matches!(self.mode, RenderMode::Preview) {
-            return self.apply_preview(action);
-        }
-        self.apply_raw(action)
-    }
-
-    pub fn paste_text(&mut self, text: &str) {
-        if self.mode != RenderMode::Raw {
-            self.status = Some("preview mode is read-only — press F2 to edit".into());
-            return;
-        }
-        self.delete_selection();
-        let idx = self.cursor.char_offset(&self.document.rope);
-        self.document.rope.insert(idx, text);
-        self.document.dirty = true;
-        let inserted = text.chars().count();
-        self.set_cursor_to_char_offset(idx + inserted);
-        self.selection_anchor = None;
-        self.preview_cache = None;
-        self.status = Some(format!("pasted {inserted} chars"));
-    }
-
-    pub fn preview_lines(&mut self) -> &[Line<'static>] {
-        if self.preview_cache.is_none() {
-            let text = self.document.rope.to_string();
-            self.preview_cache = Some(parser::render(&text));
-        }
-        self.preview_cache.as_deref().unwrap_or(&[])
-    }
-
-    fn apply_raw(&mut self, action: Action) -> Result<ActionOutcome> {
         match action {
-            Action::TogglePreview => unreachable!("handled before dispatch"),
             Action::Move(m, extend) => self.apply_move(m, extend),
             Action::InsertChar(c) => {
                 self.delete_selection();
@@ -179,54 +166,38 @@ impl Editor {
             Action::MouseDown(col, row) => self.handle_mouse_down(col, row),
             Action::MouseDrag(col, row) => self.handle_mouse_drag(col, row),
             Action::MouseUp => {}
-            Action::WheelUp => self.scroll_raw(-3),
-            Action::WheelDown => self.scroll_raw(3),
+            Action::WheelUp => self.wheel(-3),
+            Action::WheelDown => self.wheel(3),
+            Action::TogglePreview => unreachable!(),
         }
         self.cursor.clamp(&self.document.rope);
         Ok(ActionOutcome::Continue)
     }
 
-    fn apply_preview(&mut self, action: Action) -> Result<ActionOutcome> {
-        match action {
-            Action::Save => match self.document.save() {
-                Ok(()) => {
-                    self.status = Some(format!("saved {}", self.document.display_name()));
-                    return Ok(ActionOutcome::Saved);
-                }
-                Err(e) => {
-                    self.status = Some(format!("save failed: {e}"));
-                }
-            },
-            Action::Quit => return Ok(ActionOutcome::Quit),
-            Action::Move(Move::Up, _) => self.scroll_preview(-1),
-            Action::Move(Move::Down, _) => self.scroll_preview(1),
-            Action::Move(Move::PageUp, _) => {
-                let step = self.viewport_height.max(1) as isize;
-                self.scroll_preview(-step);
-            }
-            Action::Move(Move::PageDown, _) => {
-                let step = self.viewport_height.max(1) as isize;
-                self.scroll_preview(step);
-            }
-            Action::WheelUp => self.scroll_preview(-3),
-            Action::WheelDown => self.scroll_preview(3),
-            Action::MouseDown(_, _) | Action::MouseDrag(_, _) | Action::MouseUp => {}
-            Action::TogglePreview => unreachable!(),
-            _ => {
-                self.status = Some("preview mode is read-only — press F2 to edit".into());
-            }
-        }
-        Ok(ActionOutcome::Continue)
+    pub fn paste_text(&mut self, text: &str) {
+        self.delete_selection();
+        let idx = self.cursor.char_offset(&self.document.rope);
+        self.document.rope.insert(idx, text);
+        self.document.dirty = true;
+        let inserted = text.chars().count();
+        self.set_cursor_to_char_offset(idx + inserted);
+        self.selection_anchor = None;
+        self.preview_cache = None;
+        self.status = Some(format!("pasted {inserted} chars"));
     }
 
-    fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            RenderMode::Raw => {
-                self.preview_top = 0;
-                RenderMode::Preview
-            }
-            RenderMode::Preview => RenderMode::Raw,
-        };
+    /// Build (or reuse) the preview layout for this frame.
+    pub fn preview_layout(&mut self) -> PreviewLayout {
+        self.ensure_preview_cache();
+        let blocks = self.preview_cache.as_deref().unwrap_or(&[]);
+        build_preview_layout(self, blocks)
+    }
+
+    fn ensure_preview_cache(&mut self) {
+        if self.preview_cache.is_none() {
+            let text = self.document.rope.to_string();
+            self.preview_cache = Some(parser::render(&text));
+        }
     }
 
     fn apply_move(&mut self, m: Move, extend: bool) {
@@ -315,16 +286,14 @@ impl Editor {
         }
     }
 
-    fn scroll_raw(&mut self, delta: isize) {
+    fn wheel(&mut self, delta: isize) {
         let total = self.document.rope.len_lines();
         let cap = total.saturating_sub(1);
-        self.viewport_top = adjust(self.viewport_top, delta, cap);
-    }
-
-    fn scroll_preview(&mut self, delta: isize) {
-        let total = self.preview_cache.as_ref().map(|v| v.len()).unwrap_or(0);
-        let cap = total.saturating_sub(self.viewport_height.max(1) as usize);
-        self.preview_top = adjust(self.preview_top, delta, cap);
+        self.viewport_top = if delta < 0 {
+            self.viewport_top.saturating_sub((-delta) as usize)
+        } else {
+            (self.viewport_top + delta as usize).min(cap)
+        };
     }
 
     fn handle_mouse_down(&mut self, col: u16, row: u16) {
@@ -377,7 +346,7 @@ impl Editor {
         display
     }
 
-    pub fn scroll_to_cursor(&mut self) {
+    pub fn scroll_to_cursor_raw(&mut self) {
         let h = self.viewport_height as usize;
         let w = self.viewport_width as usize;
         if h == 0 || w == 0 {
@@ -397,10 +366,72 @@ impl Editor {
     }
 }
 
-fn adjust(current: usize, delta: isize, cap: usize) -> usize {
-    if delta < 0 {
-        current.saturating_sub((-delta) as usize)
+fn block_source_lines(editor: &Editor, block: &Block) -> Range<usize> {
+    let rope = &editor.document.rope;
+    let total = rope.len_lines();
+    let start = rope.byte_to_line(block.source_bytes.start.min(rope.len_bytes()));
+    let end_byte = block.source_bytes.end.min(rope.len_bytes());
+    let end = if end_byte > block.source_bytes.start {
+        rope.byte_to_line(end_byte.saturating_sub(1)) + 1
     } else {
-        (current + delta as usize).min(cap)
+        start
+    };
+    start..end.min(total)
+}
+
+fn build_preview_layout(editor: &Editor, blocks: &[Block]) -> PreviewLayout {
+    let rope = &editor.document.rope;
+    let total_lines = rope.len_lines();
+    let cursor_line = editor.cursor.line;
+    let sel_lines = editor.selection_line_range();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_rendered_line: usize = 0;
+    let mut prev_end = 0usize;
+
+    let emit_raw = |range: Range<usize>,
+                    lines: &mut Vec<Line<'static>>,
+                    cursor_rendered_line: &mut usize| {
+        for ln in range {
+            if ln >= total_lines {
+                break;
+            }
+            if ln == cursor_line {
+                *cursor_rendered_line = lines.len();
+            }
+            let s: String = rope
+                .line(ln)
+                .chars()
+                .take_while(|c| *c != '\n' && *c != '\r')
+                .collect();
+            lines.push(Line::raw(s));
+        }
+    };
+
+    for block in blocks {
+        let src = block_source_lines(editor, block);
+        if src.start > prev_end {
+            emit_raw(prev_end..src.start, &mut lines, &mut cursor_rendered_line);
+        }
+        let raw_fallback = src.contains(&cursor_line)
+            || sel_lines
+                .as_ref()
+                .is_some_and(|s| !(s.end <= src.start || s.start >= src.end));
+        if raw_fallback {
+            emit_raw(src.clone(), &mut lines, &mut cursor_rendered_line);
+        } else {
+            for l in &block.rendered_lines {
+                lines.push(l.clone());
+            }
+        }
+        prev_end = src.end;
+    }
+    if prev_end < total_lines {
+        emit_raw(prev_end..total_lines, &mut lines, &mut cursor_rendered_line);
+    }
+
+    PreviewLayout {
+        lines,
+        cursor_rendered_line,
     }
 }
