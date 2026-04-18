@@ -12,6 +12,9 @@ mod render;
 mod terminal;
 mod watcher;
 
+#[cfg(test)]
+mod visual_tests;
+
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).map(PathBuf::from);
     let document = match path {
