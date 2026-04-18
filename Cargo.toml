@@ -15,6 +15,9 @@ thiserror = "2"
 unicode-width = "0.2"
 base64 = "0.22"
 pulldown-cmark = { version = "0.12", default-features = false }
+notify = "7"
+notify-debouncer-full = "0.4"
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"

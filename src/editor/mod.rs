@@ -4,12 +4,15 @@ pub mod input;
 use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
+use ropey::Rope;
+use sha2::{Digest, Sha256};
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
 use crate::clipboard;
 use crate::document::{line_len_no_newline, Document};
 use crate::parser::{self, Block};
+use crate::watcher::WatchEvent;
 use cursor::Cursor;
 use input::{Action, Move};
 
@@ -31,7 +34,13 @@ pub struct Editor {
     pub content_area: Rect,
     pub status: Option<String>,
     pub mode: RenderMode,
+    pub pending_reload: Option<PendingReload>,
     preview_cache: Option<Vec<Block>>,
+}
+
+pub struct PendingReload {
+    pub disk_text: String,
+    pub disk_hash: [u8; 32],
 }
 
 pub enum ActionOutcome {
@@ -63,8 +72,66 @@ impl Editor {
             content_area: Rect::default(),
             status: None,
             mode: RenderMode::Raw,
+            pending_reload: None,
             preview_cache: None,
         }
+    }
+
+    pub fn handle_watch_event(&mut self, event: WatchEvent) {
+        match event {
+            WatchEvent::Changed => self.reconcile_disk_change(),
+            WatchEvent::Removed => {
+                self.status = Some("file removed from disk".into());
+            }
+            WatchEvent::Error(e) => {
+                self.status = Some(format!("watcher error: {e}"));
+            }
+        }
+    }
+
+    fn reconcile_disk_change(&mut self) {
+        let Some(path) = self.document.path.clone() else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+        if Some(hash) == self.document.last_save_hash {
+            return;
+        }
+        let disk_text = String::from_utf8_lossy(&bytes).into_owned();
+        if !self.document.dirty {
+            self.apply_reload(&disk_text, hash);
+            self.status = Some("reloaded from disk".into());
+        } else {
+            self.pending_reload = Some(PendingReload { disk_text, disk_hash: hash });
+            self.status = Some("DISK CHANGED — r: reload | i: keep mine".into());
+        }
+    }
+
+    pub fn accept_reload(&mut self) {
+        if let Some(p) = self.pending_reload.take() {
+            self.apply_reload(&p.disk_text, p.disk_hash);
+            self.status = Some("reloaded from disk, discarded local changes".into());
+        }
+    }
+
+    pub fn reject_reload(&mut self) {
+        if let Some(p) = self.pending_reload.take() {
+            self.document.last_save_hash = Some(p.disk_hash);
+            self.status = Some("ignored disk change, keeping local buffer".into());
+        }
+    }
+
+    fn apply_reload(&mut self, text: &str, hash: [u8; 32]) {
+        self.document.rope = Rope::from_str(text);
+        self.document.dirty = false;
+        self.document.last_save_hash = Some(hash);
+        self.cursor.clamp(&self.document.rope);
+        self.selection_anchor = None;
+        self.preview_cache = None;
     }
 
     pub fn selection_range(&self) -> Option<Range<usize>> {

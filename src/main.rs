@@ -8,6 +8,7 @@ mod editor;
 mod parser;
 mod render;
 mod terminal;
+mod watcher;
 
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).map(PathBuf::from);
@@ -17,7 +18,12 @@ fn main() -> Result<()> {
     };
 
     let editor = editor::Editor::new(document);
-    let mut app = app::App::new(editor);
+    let watcher = editor
+        .document
+        .path
+        .as_ref()
+        .and_then(|p| watcher::FileWatcher::new(p).ok());
+    let mut app = app::App::new(editor, watcher);
 
     let mut tui = terminal::enter()?;
     let run_result = app.run(&mut tui);
