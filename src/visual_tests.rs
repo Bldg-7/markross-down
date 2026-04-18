@@ -18,6 +18,7 @@ use ropey::Rope;
 
 use crate::document::Document;
 use crate::editor::{Editor, RenderMode};
+use crate::merge::{Decision, MergeState};
 use crate::plugin::PluginHost;
 use crate::render;
 use crate::theme::Theme;
@@ -282,13 +283,44 @@ fn snapshot_selection() {
 }
 
 #[test]
+fn snapshot_merge_view() {
+    let mine = "\
+# Project status
+
+- [x] scaffolding
+- [ ] preview mode
+- [ ] plugins
+
+Notes: ongoing, TBD details.
+";
+    let theirs = "\
+# Project status
+
+- [x] scaffolding
+- [x] preview mode
+- [ ] plugins
+- [ ] theme
+
+Notes: see DESIGN.md.
+";
+    let state = MergeState::new(mine.to_string(), theirs.to_string(), [0; 32]).unwrap();
+    let mut editor = make_editor(mine);
+    editor.merge = Some(state);
+    // Mark one hunk as decided to show the styling difference.
+    editor.merge.as_mut().unwrap().hunks[0].decision = Decision::Theirs;
+    render_editor_to_png(&mut editor, 80, 22, &snapshot_path("merge_view"));
+}
+
+#[test]
 fn snapshot_custom_theme() {
-    let mut theme = Theme::default();
-    theme.heading1 = "#00ff88".into();
-    theme.inline_code = "#ff88cc".into();
-    theme.border = "rgb(120, 120, 180)".into();
-    theme.status_bg = "#202040".into();
-    theme.status_fg = "lightcyan".into();
+    let theme = Theme {
+        heading1: "#00ff88".into(),
+        inline_code: "#ff88cc".into(),
+        border: "rgb(120, 120, 180)".into(),
+        status_bg: "#202040".into(),
+        status_fg: "lightcyan".into(),
+        ..Theme::default()
+    };
 
     let mut doc = Document::empty();
     doc.rope = Rope::from_str(SAMPLE_MD);

@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::clipboard;
 use crate::document::{line_len_no_newline, Document};
+use crate::merge::{Decision, MergeState};
 use crate::parser::{self, Block};
 use crate::plugin::{PluginHost, PluginOutput, PluginState};
 use crate::theme::Theme;
@@ -36,21 +37,29 @@ pub struct Editor {
     pub content_area: Rect,
     pub status: Option<String>,
     pub mode: RenderMode,
-    pub pending_reload: Option<PendingReload>,
+    pub merge: Option<MergeState>,
+    pub merge_scroll: u16,
     pub plugin_host: PluginHost,
     pub theme: Theme,
     preview_cache: Option<Vec<Block>>,
-}
-
-pub struct PendingReload {
-    pub disk_text: String,
-    pub disk_hash: [u8; 32],
 }
 
 pub enum ActionOutcome {
     Continue,
     Saved,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MergeAction {
+    Next,
+    Prev,
+    PickMine,
+    PickTheirs,
+    AllMine,
+    AllTheirs,
+    Apply,
+    Abort,
 }
 
 /// Flattened preview output for one frame, produced by `Editor::preview_layout`.
@@ -81,7 +90,8 @@ impl Editor {
             content_area: Rect::default(),
             status: None,
             mode: RenderMode::Raw,
-            pending_reload: None,
+            merge: None,
+            merge_scroll: 0,
             plugin_host,
             theme,
             preview_cache: None,
@@ -114,32 +124,62 @@ impl Editor {
         }
         let disk_text = String::from_utf8_lossy(&bytes).into_owned();
         if !self.document.dirty {
-            self.apply_reload(&disk_text, hash);
+            self.apply_merge_result(&disk_text, hash, true);
             self.status = Some("reloaded from disk".into());
-        } else {
-            self.pending_reload = Some(PendingReload { disk_text, disk_hash: hash });
-            self.status = Some("DISK CHANGED — r: reload | i: keep mine".into());
+            return;
+        }
+        let mine = self.document.rope.to_string();
+        match MergeState::new(mine, disk_text.clone(), hash) {
+            Some(state) => {
+                let n = state.hunks.len();
+                self.merge = Some(state);
+                self.merge_scroll = 0;
+                self.status = Some(format!("DISK CONFLICT — {n} hunk(s); see merge view"));
+            }
+            None => {
+                // Strings differ only in byte encoding or trailing whitespace —
+                // treat as a no-op reload.
+                self.apply_merge_result(&disk_text, hash, true);
+            }
         }
     }
 
-    pub fn accept_reload(&mut self) {
-        if let Some(p) = self.pending_reload.take() {
-            self.apply_reload(&p.disk_text, p.disk_hash);
-            self.status = Some("reloaded from disk, discarded local changes".into());
+    pub fn merge_action(&mut self, action: MergeAction) {
+        let Some(merge) = self.merge.as_mut() else {
+            return;
+        };
+        match action {
+            MergeAction::Next => merge.next_hunk(),
+            MergeAction::Prev => merge.prev_hunk(),
+            MergeAction::PickMine => merge.set_current(Decision::Mine),
+            MergeAction::PickTheirs => merge.set_current(Decision::Theirs),
+            MergeAction::AllMine => merge.set_all(Decision::Mine),
+            MergeAction::AllTheirs => merge.set_all(Decision::Theirs),
+            MergeAction::Apply => {
+                let text = merge.apply();
+                let hash = merge.theirs_hash;
+                let is_theirs = text == merge.theirs;
+                self.merge = None;
+                self.apply_merge_result(&text, hash, is_theirs);
+                self.status = Some(if is_theirs {
+                    "merge applied: took disk version".into()
+                } else {
+                    "merge applied — save to persist to disk".into()
+                });
+            }
+            MergeAction::Abort => {
+                let hash = merge.theirs_hash;
+                self.merge = None;
+                self.document.last_save_hash = Some(hash);
+                self.status = Some("merge aborted, keeping local buffer".into());
+            }
         }
     }
 
-    pub fn reject_reload(&mut self) {
-        if let Some(p) = self.pending_reload.take() {
-            self.document.last_save_hash = Some(p.disk_hash);
-            self.status = Some("ignored disk change, keeping local buffer".into());
-        }
-    }
-
-    fn apply_reload(&mut self, text: &str, hash: [u8; 32]) {
+    fn apply_merge_result(&mut self, text: &str, disk_hash: [u8; 32], is_clean: bool) {
         self.document.rope = Rope::from_str(text);
-        self.document.dirty = false;
-        self.document.last_save_hash = Some(hash);
+        self.document.dirty = !is_clean;
+        self.document.last_save_hash = Some(disk_hash);
         self.cursor.clamp(&self.document.rope);
         self.selection_anchor = None;
         self.preview_cache = None;

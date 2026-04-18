@@ -6,6 +6,7 @@ mod clipboard;
 mod config;
 mod document;
 mod editor;
+mod merge;
 mod parser;
 mod plugin;
 mod render;

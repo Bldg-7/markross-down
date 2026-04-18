@@ -1,11 +1,12 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::editor::{Editor, RenderMode};
+use crate::merge::Decision;
 
 pub fn draw(editor: &mut Editor, frame: &mut Frame) {
     let area = frame.area();
@@ -17,15 +18,127 @@ pub fn draw(editor: &mut Editor, frame: &mut Frame) {
     editor.viewport_width = content.width;
     editor.content_area = content;
 
-    match editor.mode {
-        RenderMode::Raw => {
-            editor.scroll_to_cursor_raw();
-            draw_raw(editor, frame, content);
-            place_cursor_raw(editor, frame, content);
+    if editor.merge.is_some() {
+        draw_merge(editor, frame, content);
+    } else {
+        match editor.mode {
+            RenderMode::Raw => {
+                editor.scroll_to_cursor_raw();
+                draw_raw(editor, frame, content);
+                place_cursor_raw(editor, frame, content);
+            }
+            RenderMode::Preview => draw_preview(editor, frame, content),
         }
-        RenderMode::Preview => draw_preview(editor, frame, content),
     }
     draw_status(editor, frame, status);
+}
+
+fn draw_merge(editor: &mut Editor, frame: &mut Frame, area: Rect) {
+    let Some(merge) = editor.merge.as_ref() else {
+        return;
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Header
+    let pending = merge.pending_count();
+    lines.push(Line::from(vec![
+        Span::styled(
+            " MERGE ",
+            Style::default().bg(Color::Yellow).fg(Color::Black),
+        ),
+        Span::raw(format!(
+            "  hunk {}/{}   pending {}   ",
+            merge.current + 1,
+            merge.hunks.len(),
+            pending
+        )),
+    ]));
+    lines.push(Line::from(Span::styled(
+        " j/k navigate   m/t pick current   M/T pick all   Enter apply   Esc abort",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::raw(""));
+
+    // Track position of current hunk for scroll
+    let mut current_hunk_line: usize = 0;
+
+    for (idx, hunk) in merge.hunks.iter().enumerate() {
+        if idx == merge.current {
+            current_hunk_line = lines.len();
+        }
+        let pointer = if idx == merge.current { "▶ " } else { "  " };
+        let decision_label = match hunk.decision {
+            Decision::Pending => "[?  pending]",
+            Decision::Mine => "[✓ mine]",
+            Decision::Theirs => "[✓ theirs]",
+        };
+        let decision_color = match hunk.decision {
+            Decision::Pending => Color::Yellow,
+            Decision::Mine => Color::Red,
+            Decision::Theirs => Color::Green,
+        };
+        let hunk_num = idx + 1;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{pointer}── hunk {hunk_num} "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                decision_label.to_string(),
+                Style::default().fg(decision_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ────────────────".to_string(), Style::default().fg(Color::DarkGray)),
+        ]));
+        for ctx in &hunk.context_before {
+            lines.push(Line::from(Span::styled(
+                format!("    {ctx}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let mine_style = style_for_side(hunk.decision, Color::Red, Decision::Mine);
+        for line in &hunk.mine_lines {
+            lines.push(Line::from(Span::styled(format!("  - {line}"), mine_style)));
+        }
+        let theirs_style = style_for_side(hunk.decision, Color::Green, Decision::Theirs);
+        for line in &hunk.theirs_lines {
+            lines.push(Line::from(Span::styled(format!("  + {line}"), theirs_style)));
+        }
+        for ctx in &hunk.context_after {
+            lines.push(Line::from(Span::styled(
+                format!("    {ctx}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // Keep current hunk in view.
+    let h = area.height as usize;
+    if h > 0 {
+        let current_line = current_hunk_line;
+        let scroll = editor.merge_scroll as usize;
+        let new_scroll = if current_line < scroll {
+            current_line
+        } else if current_line >= scroll + h {
+            current_line.saturating_sub(h.saturating_sub(4))
+        } else {
+            scroll
+        };
+        editor.merge_scroll = new_scroll as u16;
+    }
+
+    let paragraph = Paragraph::new(lines).scroll((editor.merge_scroll, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn style_for_side(decision: Decision, base: Color, this_side: Decision) -> Style {
+    match decision {
+        Decision::Pending => Style::default().fg(base),
+        d if d == this_side => Style::default().fg(base).add_modifier(Modifier::BOLD),
+        _ => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::CROSSED_OUT),
+    }
 }
 
 fn draw_raw(editor: &Editor, frame: &mut Frame, area: Rect) {

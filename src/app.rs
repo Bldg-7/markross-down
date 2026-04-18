@@ -1,9 +1,9 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::Duration;
 
 use crate::editor::input::{key_to_action, mouse_to_action};
-use crate::editor::{ActionOutcome, Editor};
+use crate::editor::{ActionOutcome, Editor, MergeAction};
 use crate::render;
 use crate::terminal::Tui;
 use crate::watcher::FileWatcher;
@@ -24,8 +24,10 @@ impl App {
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if self.editor.pending_reload.is_some() {
-                            self.handle_reload_key(key.code);
+                        if self.editor.merge.is_some() {
+                            if let Some(action) = merge_key_to_action(key) {
+                                self.editor.merge_action(action);
+                            }
                         } else if let Some(action) = key_to_action(key) {
                             if let ActionOutcome::Quit = self.editor.apply(action)? {
                                 return Ok(());
@@ -33,7 +35,7 @@ impl App {
                         }
                     }
                     Event::Mouse(mouse) => {
-                        if self.editor.pending_reload.is_some() {
+                        if self.editor.merge.is_some() {
                             continue;
                         }
                         let area = self.editor.content_area;
@@ -44,7 +46,7 @@ impl App {
                         }
                     }
                     Event::Paste(text) => {
-                        if self.editor.pending_reload.is_none() {
+                        if self.editor.merge.is_none() {
                             self.editor.paste_text(&text);
                         }
                     }
@@ -59,17 +61,19 @@ impl App {
             }
         }
     }
+}
 
-    fn handle_reload_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Char('r') | KeyCode::Char('R') => self.editor.accept_reload(),
-            KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Esc => {
-                self.editor.reject_reload()
-            }
-            _ => {
-                self.editor.status =
-                    Some("press R to reload or I to keep mine".into());
-            }
-        }
+fn merge_key_to_action(key: KeyEvent) -> Option<MergeAction> {
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => Some(MergeAction::Next),
+        KeyCode::Char('k') | KeyCode::Up => Some(MergeAction::Prev),
+        KeyCode::Char('m') if !shift => Some(MergeAction::PickMine),
+        KeyCode::Char('t') if !shift => Some(MergeAction::PickTheirs),
+        KeyCode::Char('M') | KeyCode::Char('m') if shift => Some(MergeAction::AllMine),
+        KeyCode::Char('T') | KeyCode::Char('t') if shift => Some(MergeAction::AllTheirs),
+        KeyCode::Enter => Some(MergeAction::Apply),
+        KeyCode::Esc => Some(MergeAction::Abort),
+        _ => None,
     }
 }
