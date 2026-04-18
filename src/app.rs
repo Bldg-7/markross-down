@@ -28,7 +28,7 @@ impl App {
                             if let Some(action) = merge_key_to_action(key) {
                                 self.editor.merge_action(action);
                             }
-                        } else if let Some(action) = key_to_action(key) {
+                        } else if let Some(action) = key_to_action(key, &self.editor.keybinds) {
                             if let ActionOutcome::Quit = self.editor.apply(action)? {
                                 return Ok(());
                             }

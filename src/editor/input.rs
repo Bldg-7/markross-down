@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::keybind::KeybindTable;
+
 #[derive(Debug, Clone, Copy)]
 pub enum Move {
     Left,
@@ -34,7 +36,11 @@ pub enum Action {
     WheelDown,
 }
 
-pub fn key_to_action(key: KeyEvent) -> Option<Action> {
+pub fn key_to_action(key: KeyEvent, keybinds: &KeybindTable) -> Option<Action> {
+    // User-defined keybinds win over defaults for the same key combo.
+    if let Some(a) = keybinds.lookup(&key) {
+        return Some(a);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let mv = |m: Move| Some(Action::Move(m, shift));

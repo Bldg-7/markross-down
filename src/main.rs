@@ -6,6 +6,7 @@ mod clipboard;
 mod config;
 mod document;
 mod editor;
+mod keybind;
 mod merge;
 mod parser;
 mod plugin;
@@ -27,16 +28,32 @@ fn main() -> Result<()> {
     let loaded = config::load();
     let plugins = config::resolve_plugins(&loaded.config.plugins);
     let host = plugin::PluginHost::new(plugins);
+    let (keybinds, keybind_errors) =
+        keybind::KeybindTable::from_config(&loaded.config.keybinds);
 
-    let mut editor = editor::Editor::with_theme(document, host, loaded.config.theme.clone());
-    editor.status = match &loaded.source {
-        config::ConfigSource::File(p) => Some(format!("config: {}", p.display())),
+    let mut editor = editor::Editor::build(
+        document,
+        host,
+        loaded.config.theme.clone(),
+        keybinds,
+    );
+
+    let startup_status = match &loaded.source {
+        config::ConfigSource::File(p) if keybind_errors.is_empty() => {
+            Some(format!("config: {}", p.display()))
+        }
+        config::ConfigSource::File(p) => Some(format!(
+            "config: {} — keybind errors: {}",
+            p.display(),
+            keybind_errors.join("; ")
+        )),
         config::ConfigSource::Defaults => None,
         config::ConfigSource::Error { path, message } => Some(format!(
             "config error at {}: {message} — using defaults",
             path.display()
         )),
     };
+    editor.status = startup_status;
 
     let watcher = editor
         .document

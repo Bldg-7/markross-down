@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::clipboard;
 use crate::document::{line_len_no_newline, Document};
+use crate::keybind::KeybindTable;
 use crate::merge::{Decision, MergeState};
 use crate::parser::{self, Block};
 use crate::plugin::{PluginHost, PluginOutput, PluginState};
@@ -41,6 +42,7 @@ pub struct Editor {
     pub merge_scroll: u16,
     pub plugin_host: PluginHost,
     pub theme: Theme,
+    pub keybinds: KeybindTable,
     preview_cache: Option<Vec<Block>>,
 }
 
@@ -74,10 +76,20 @@ pub struct PreviewLayout {
 impl Editor {
     #[cfg(test)]
     pub fn new(document: Document, plugin_host: PluginHost) -> Self {
-        Self::with_theme(document, plugin_host, Theme::default())
+        Self::build(document, plugin_host, Theme::default(), KeybindTable::default())
     }
 
+    #[cfg(test)]
     pub fn with_theme(document: Document, plugin_host: PluginHost, theme: Theme) -> Self {
+        Self::build(document, plugin_host, theme, KeybindTable::default())
+    }
+
+    pub fn build(
+        document: Document,
+        plugin_host: PluginHost,
+        theme: Theme,
+        keybinds: KeybindTable,
+    ) -> Self {
         Self {
             document,
             cursor: Cursor::default(),
@@ -94,6 +106,7 @@ impl Editor {
             merge_scroll: 0,
             plugin_host,
             theme,
+            keybinds,
             preview_cache: None,
         }
     }

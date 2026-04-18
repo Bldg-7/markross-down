@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::keybind::KeybindEntry;
 use crate::plugin::{default_plugins, PluginDef};
 use crate::theme::Theme;
 
@@ -15,6 +16,8 @@ pub struct Config {
     pub plugins: Vec<PluginDef>,
     #[serde(default)]
     pub theme: Theme,
+    #[serde(default, rename = "keybinds")]
+    pub keybinds: Vec<KeybindEntry>,
 }
 
 pub struct LoadedConfig {
