@@ -20,6 +20,7 @@ use crate::document::Document;
 use crate::editor::{Editor, RenderMode};
 use crate::plugin::PluginHost;
 use crate::render;
+use crate::theme::Theme;
 
 const FONT_SIZE: f32 = 16.0;
 const CELL_W: u32 = 10;
@@ -278,4 +279,21 @@ fn snapshot_selection() {
     editor.cursor.line = 0;
     editor.cursor.col = 21;
     render_editor_to_png(&mut editor, 60, 6, &snapshot_path("selection"));
+}
+
+#[test]
+fn snapshot_custom_theme() {
+    let mut theme = Theme::default();
+    theme.heading1 = "#00ff88".into();
+    theme.inline_code = "#ff88cc".into();
+    theme.border = "rgb(120, 120, 180)".into();
+    theme.status_bg = "#202040".into();
+    theme.status_fg = "lightcyan".into();
+
+    let mut doc = Document::empty();
+    doc.rope = Rope::from_str(SAMPLE_MD);
+    let mut editor = Editor::with_theme(doc, PluginHost::new(Vec::new()), theme);
+    editor.mode = RenderMode::Preview;
+    editor.cursor.line = 999;
+    render_editor_to_png(&mut editor, 60, 18, &snapshot_path("custom_theme"));
 }

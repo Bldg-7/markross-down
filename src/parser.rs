@@ -11,6 +11,7 @@ use tui_big_text::{BigText, PixelSize};
 use unicode_width::UnicodeWidthStr;
 
 use crate::plugin::{PluginHost, PluginInvocation};
+use crate::theme::Theme;
 
 /// A top-level Markdown block with its pre-rendered styled lines.
 pub struct Block {
@@ -25,7 +26,7 @@ pub struct Block {
     pub plugin_invocation: Option<PluginInvocation>,
 }
 
-pub fn render(markdown: &str, host: Option<&PluginHost>) -> Vec<Block> {
+pub fn render(markdown: &str, host: Option<&PluginHost>, theme: &Theme) -> Vec<Block> {
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS;
@@ -41,7 +42,7 @@ pub fn render(markdown: &str, host: Option<&PluginHost>) -> Vec<Block> {
             let end_byte = events[end_idx].1.end;
             let slice: Vec<(Event<'_>, Range<usize>)> = events[i..=end_idx].to_vec();
             let plugin_invocation = extract_plugin_invocation(&slice, host);
-            let rendered = render_events(slice);
+            let rendered = render_events(slice, theme);
             blocks.push(Block {
                 id: next_id,
                 source_bytes: start_byte..end_byte,
@@ -57,7 +58,7 @@ pub fn render(markdown: &str, host: Option<&PluginHost>) -> Vec<Block> {
                     source_bytes: events[i].1.clone(),
                     rendered_lines: vec![Line::from(Span::styled(
                         "─".repeat(60),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.border()),
                     ))],
                     plugin_invocation: None,
                 });
@@ -144,7 +145,7 @@ fn is_block_tag_end(te: &TagEnd) -> bool {
     )
 }
 
-fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
+fn render_events(events: Vec<(Event<'_>, Range<usize>)>, theme: &Theme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default()];
@@ -189,7 +190,8 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     flush(&mut current, &line_prefix, &mut out);
-                    let (color, marker) = heading_style(level);
+                    let color = theme.heading(level_to_u8(level));
+                    let marker = heading_marker(level);
                     if level == HeadingLevel::H1 {
                         big_heading = Some((color, String::new()));
                     } else {
@@ -201,7 +203,7 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                 Tag::Paragraph => {}
                 Tag::BlockQuote(_) => line_prefix.push(Span::styled(
                     "│ ",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.border()),
                 )),
                 Tag::CodeBlock(kind) => {
                     flush(&mut current, &line_prefix, &mut out);
@@ -216,9 +218,9 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                         .unwrap_or_else(|| "──────────────────────────".to_string());
                     out.push(Line::from(Span::styled(
                         header,
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.border()),
                     )));
-                    style_stack.push(Style::default().fg(Color::LightYellow));
+                    style_stack.push(Style::default().fg(theme.code_block()));
                 }
                 Tag::List(start) => list_stack.push(match start {
                     Some(n) => ListKind::Ordered(n),
@@ -251,12 +253,12 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                 Tag::Link { dest_url, .. } => {
                     link_urls.push(dest_url.into_string());
                     let base = *style_stack.last().unwrap();
-                    style_stack.push(base.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED));
+                    style_stack.push(base.fg(theme.link()).add_modifier(Modifier::UNDERLINED));
                 }
                 Tag::Image { dest_url, .. } => push_inline(
                     Span::styled(
                         format!("[image: {dest_url}]"),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(theme.image()),
                     ),
                     in_table_cell,
                     &mut current,
@@ -294,7 +296,7 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                     in_code_block = false;
                     out.push(Line::from(Span::styled(
                         "──────────────────────────",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.border()),
                     )));
                 }
                 TagEnd::List(_) => {
@@ -310,7 +312,7 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                         push_inline(
                             Span::styled(
                                 format!(" ({url})"),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(theme.border()),
                             ),
                             in_table_cell,
                             &mut current,
@@ -319,7 +321,7 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                     }
                 }
                 TagEnd::Table => {
-                    let rendered = render_table(&table_rows, &table_aligns);
+                    let rendered = render_table(&table_rows, &table_aligns, theme);
                     out.extend(rendered);
                     table_rows.clear();
                     table_aligns.clear();
@@ -364,7 +366,7 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                     continue;
                 }
                 push_inline(
-                    Span::styled(c.into_string(), Style::default().fg(Color::LightYellow)),
+                    Span::styled(c.into_string(), Style::default().fg(theme.inline_code())),
                     in_table_cell,
                     &mut current,
                     &mut current_cell,
@@ -452,7 +454,11 @@ fn widget_to_lines<W: Widget>(widget: W, width: u16, height: u16) -> Vec<Line<'s
     lines
 }
 
-fn render_table(rows: &[Vec<Vec<Span<'static>>>], aligns: &[Alignment]) -> Vec<Line<'static>> {
+fn render_table(
+    rows: &[Vec<Vec<Span<'static>>>],
+    aligns: &[Alignment],
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if rows.is_empty() {
         return Vec::new();
     }
@@ -472,7 +478,7 @@ fn render_table(rows: &[Vec<Vec<Span<'static>>>], aligns: &[Alignment]) -> Vec<L
             }
         }
     }
-    let border = Style::default().fg(Color::DarkGray);
+    let border = Style::default().fg(theme.border());
     let mut lines = Vec::new();
     lines.push(make_border(&widths, '┌', '┬', '┐', border));
     for (idx, row) in rows.iter().enumerate() {
@@ -546,13 +552,24 @@ enum ListKind {
     Unordered,
 }
 
-fn heading_style(level: HeadingLevel) -> (Color, &'static str) {
+fn level_to_u8(level: HeadingLevel) -> u8 {
     match level {
-        HeadingLevel::H1 => (Color::Magenta, "#"),
-        HeadingLevel::H2 => (Color::Blue, "##"),
-        HeadingLevel::H3 => (Color::Cyan, "###"),
-        HeadingLevel::H4 => (Color::Green, "####"),
-        HeadingLevel::H5 => (Color::Yellow, "#####"),
-        HeadingLevel::H6 => (Color::Red, "######"),
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+fn heading_marker(level: HeadingLevel) -> &'static str {
+    match level {
+        HeadingLevel::H1 => "#",
+        HeadingLevel::H2 => "##",
+        HeadingLevel::H3 => "###",
+        HeadingLevel::H4 => "####",
+        HeadingLevel::H5 => "#####",
+        HeadingLevel::H6 => "######",
     }
 }

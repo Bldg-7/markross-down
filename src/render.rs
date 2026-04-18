@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -140,8 +140,8 @@ fn draw_status(editor: &Editor, frame: &mut Frame, area: Rect) {
     let width = area.width as usize;
     let pad = width.saturating_sub(left.width() + right.width());
     let line = format!("{left}{}{right}", " ".repeat(pad));
-    let paragraph =
-        Paragraph::new(line).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let paragraph = Paragraph::new(line)
+        .style(Style::default().bg(editor.theme.status_bg()).fg(editor.theme.status_fg()));
     frame.render_widget(paragraph, area);
 }
 

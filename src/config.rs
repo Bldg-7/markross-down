@@ -5,6 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::plugin::{default_plugins, PluginDef};
+use crate::theme::Theme;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
@@ -12,6 +13,8 @@ pub struct Config {
     /// user entries take precedence when the `trigger` matches a built-in.
     #[serde(default, rename = "plugins")]
     pub plugins: Vec<PluginDef>,
+    #[serde(default)]
+    pub theme: Theme,
 }
 
 pub struct LoadedConfig {

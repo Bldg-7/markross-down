@@ -10,6 +10,7 @@ mod parser;
 mod plugin;
 mod render;
 mod terminal;
+mod theme;
 mod watcher;
 
 #[cfg(test)]
@@ -26,7 +27,7 @@ fn main() -> Result<()> {
     let plugins = config::resolve_plugins(&loaded.config.plugins);
     let host = plugin::PluginHost::new(plugins);
 
-    let mut editor = editor::Editor::new(document, host);
+    let mut editor = editor::Editor::with_theme(document, host, loaded.config.theme.clone());
     editor.status = match &loaded.source {
         config::ConfigSource::File(p) => Some(format!("config: {}", p.display())),
         config::ConfigSource::Defaults => None,

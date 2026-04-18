@@ -13,6 +13,7 @@ use crate::clipboard;
 use crate::document::{line_len_no_newline, Document};
 use crate::parser::{self, Block};
 use crate::plugin::{PluginHost, PluginOutput, PluginState};
+use crate::theme::Theme;
 use crate::watcher::WatchEvent;
 use cursor::Cursor;
 use input::{Action, Move};
@@ -37,6 +38,7 @@ pub struct Editor {
     pub mode: RenderMode,
     pub pending_reload: Option<PendingReload>,
     pub plugin_host: PluginHost,
+    pub theme: Theme,
     preview_cache: Option<Vec<Block>>,
 }
 
@@ -61,7 +63,12 @@ pub struct PreviewLayout {
 }
 
 impl Editor {
+    #[cfg(test)]
     pub fn new(document: Document, plugin_host: PluginHost) -> Self {
+        Self::with_theme(document, plugin_host, Theme::default())
+    }
+
+    pub fn with_theme(document: Document, plugin_host: PluginHost, theme: Theme) -> Self {
         Self {
             document,
             cursor: Cursor::default(),
@@ -76,6 +83,7 @@ impl Editor {
             mode: RenderMode::Raw,
             pending_reload: None,
             plugin_host,
+            theme,
             preview_cache: None,
         }
     }
@@ -266,7 +274,8 @@ impl Editor {
     fn ensure_preview_cache(&mut self) {
         if self.preview_cache.is_none() {
             let text = self.document.rope.to_string();
-            self.preview_cache = Some(parser::render(&text, Some(&self.plugin_host)));
+            self.preview_cache =
+                Some(parser::render(&text, Some(&self.plugin_host), &self.theme));
         }
     }
 
