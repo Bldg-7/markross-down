@@ -3,26 +3,36 @@ pub mod input;
 
 use anyhow::Result;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
 use crate::clipboard;
 use crate::document::{line_len_no_newline, Document};
+use crate::parser;
 use cursor::Cursor;
 use input::{Action, Move};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    Raw,
+    Preview,
+}
 
 pub struct Editor {
     pub document: Document,
     pub cursor: Cursor,
     /// Character offset where Shift- or mouse-anchored selection started.
-    /// `None` means no active selection.
     pub selection_anchor: Option<usize>,
     pub viewport_top: usize,
     pub viewport_left: usize,
+    pub preview_top: usize,
     pub viewport_height: u16,
     pub viewport_width: u16,
     pub content_area: Rect,
     pub status: Option<String>,
+    pub mode: RenderMode,
+    preview_cache: Option<Vec<Line<'static>>>,
 }
 
 pub enum ActionOutcome {
@@ -39,10 +49,13 @@ impl Editor {
             selection_anchor: None,
             viewport_top: 0,
             viewport_left: 0,
+            preview_top: 0,
             viewport_height: 0,
             viewport_width: 0,
             content_area: Rect::default(),
             status: None,
+            mode: RenderMode::Raw,
+            preview_cache: None,
         }
     }
 
@@ -62,7 +75,43 @@ impl Editor {
 
     pub fn apply(&mut self, action: Action) -> Result<ActionOutcome> {
         self.status = None;
+        if let Action::TogglePreview = action {
+            self.toggle_mode();
+            return Ok(ActionOutcome::Continue);
+        }
+        if matches!(self.mode, RenderMode::Preview) {
+            return self.apply_preview(action);
+        }
+        self.apply_raw(action)
+    }
+
+    pub fn paste_text(&mut self, text: &str) {
+        if self.mode != RenderMode::Raw {
+            self.status = Some("preview mode is read-only — press F2 to edit".into());
+            return;
+        }
+        self.delete_selection();
+        let idx = self.cursor.char_offset(&self.document.rope);
+        self.document.rope.insert(idx, text);
+        self.document.dirty = true;
+        let inserted = text.chars().count();
+        self.set_cursor_to_char_offset(idx + inserted);
+        self.selection_anchor = None;
+        self.preview_cache = None;
+        self.status = Some(format!("pasted {inserted} chars"));
+    }
+
+    pub fn preview_lines(&mut self) -> &[Line<'static>] {
+        if self.preview_cache.is_none() {
+            let text = self.document.rope.to_string();
+            self.preview_cache = Some(parser::render(&text));
+        }
+        self.preview_cache.as_deref().unwrap_or(&[])
+    }
+
+    fn apply_raw(&mut self, action: Action) -> Result<ActionOutcome> {
         match action {
+            Action::TogglePreview => unreachable!("handled before dispatch"),
             Action::Move(m, extend) => self.apply_move(m, extend),
             Action::InsertChar(c) => {
                 self.delete_selection();
@@ -70,6 +119,7 @@ impl Editor {
                 self.document.insert_char(idx, c);
                 self.cursor.move_right(&self.document.rope);
                 self.selection_anchor = None;
+                self.preview_cache = None;
             }
             Action::InsertNewline => {
                 self.delete_selection();
@@ -79,6 +129,7 @@ impl Editor {
                 self.cursor.col = 0;
                 self.cursor.desired_col = 0;
                 self.selection_anchor = None;
+                self.preview_cache = None;
             }
             Action::Backspace => {
                 if self.selection_range().is_some() {
@@ -88,6 +139,7 @@ impl Editor {
                     if idx > 0 {
                         self.document.remove(idx - 1..idx);
                         self.cursor.move_left(&self.document.rope);
+                        self.preview_cache = None;
                     }
                 }
             }
@@ -98,6 +150,7 @@ impl Editor {
                     let idx = self.cursor.char_offset(&self.document.rope);
                     if idx < self.document.rope.len_chars() {
                         self.document.remove(idx..idx + 1);
+                        self.preview_cache = None;
                     }
                 }
             }
@@ -120,28 +173,60 @@ impl Editor {
             }
             Action::PasteHint => {
                 self.status = Some(
-                    "paste via terminal (Shift+Insert / Ctrl+Shift+V / Cmd+V)".to_string(),
+                    "paste via terminal (Shift+Insert / Ctrl+Shift+V / Cmd+V)".into(),
                 );
             }
             Action::MouseDown(col, row) => self.handle_mouse_down(col, row),
             Action::MouseDrag(col, row) => self.handle_mouse_drag(col, row),
             Action::MouseUp => {}
-            Action::WheelUp => self.scroll_by(-3),
-            Action::WheelDown => self.scroll_by(3),
+            Action::WheelUp => self.scroll_raw(-3),
+            Action::WheelDown => self.scroll_raw(3),
         }
         self.cursor.clamp(&self.document.rope);
         Ok(ActionOutcome::Continue)
     }
 
-    pub fn paste_text(&mut self, text: &str) {
-        self.delete_selection();
-        let idx = self.cursor.char_offset(&self.document.rope);
-        self.document.rope.insert(idx, text);
-        self.document.dirty = true;
-        let inserted = text.chars().count();
-        self.set_cursor_to_char_offset(idx + inserted);
-        self.selection_anchor = None;
-        self.status = Some(format!("pasted {inserted} chars"));
+    fn apply_preview(&mut self, action: Action) -> Result<ActionOutcome> {
+        match action {
+            Action::Save => match self.document.save() {
+                Ok(()) => {
+                    self.status = Some(format!("saved {}", self.document.display_name()));
+                    return Ok(ActionOutcome::Saved);
+                }
+                Err(e) => {
+                    self.status = Some(format!("save failed: {e}"));
+                }
+            },
+            Action::Quit => return Ok(ActionOutcome::Quit),
+            Action::Move(Move::Up, _) => self.scroll_preview(-1),
+            Action::Move(Move::Down, _) => self.scroll_preview(1),
+            Action::Move(Move::PageUp, _) => {
+                let step = self.viewport_height.max(1) as isize;
+                self.scroll_preview(-step);
+            }
+            Action::Move(Move::PageDown, _) => {
+                let step = self.viewport_height.max(1) as isize;
+                self.scroll_preview(step);
+            }
+            Action::WheelUp => self.scroll_preview(-3),
+            Action::WheelDown => self.scroll_preview(3),
+            Action::MouseDown(_, _) | Action::MouseDrag(_, _) | Action::MouseUp => {}
+            Action::TogglePreview => unreachable!(),
+            _ => {
+                self.status = Some("preview mode is read-only — press F2 to edit".into());
+            }
+        }
+        Ok(ActionOutcome::Continue)
+    }
+
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            RenderMode::Raw => {
+                self.preview_top = 0;
+                RenderMode::Preview
+            }
+            RenderMode::Preview => RenderMode::Raw,
+        };
     }
 
     fn apply_move(&mut self, m: Move, extend: bool) {
@@ -179,6 +264,7 @@ impl Editor {
             self.document.remove(range.clone());
             self.set_cursor_to_char_offset(range.start);
             self.selection_anchor = None;
+            self.preview_cache = None;
         }
     }
 
@@ -210,7 +296,7 @@ impl Editor {
 
     fn cut_selection(&mut self) {
         let Some(range) = self.selection_range() else {
-            self.status = Some("nothing selected to cut".to_string());
+            self.status = Some("nothing selected to cut".into());
             return;
         };
         let text = self.document.rope.slice(range.clone()).to_string();
@@ -220,6 +306,7 @@ impl Editor {
                 self.document.remove(range.clone());
                 self.set_cursor_to_char_offset(range.start);
                 self.selection_anchor = None;
+                self.preview_cache = None;
                 self.status = Some(format!("cut {n} chars"));
             }
             Err(e) => {
@@ -228,14 +315,16 @@ impl Editor {
         }
     }
 
-    fn scroll_by(&mut self, delta: isize) {
+    fn scroll_raw(&mut self, delta: isize) {
         let total = self.document.rope.len_lines();
         let cap = total.saturating_sub(1);
-        self.viewport_top = if delta < 0 {
-            self.viewport_top.saturating_sub((-delta) as usize)
-        } else {
-            (self.viewport_top + delta as usize).min(cap)
-        };
+        self.viewport_top = adjust(self.viewport_top, delta, cap);
+    }
+
+    fn scroll_preview(&mut self, delta: isize) {
+        let total = self.preview_cache.as_ref().map(|v| v.len()).unwrap_or(0);
+        let cap = total.saturating_sub(self.viewport_height.max(1) as usize);
+        self.preview_top = adjust(self.preview_top, delta, cap);
     }
 
     fn handle_mouse_down(&mut self, col: u16, row: u16) {
@@ -305,5 +394,13 @@ impl Editor {
         } else if dc >= self.viewport_left + w {
             self.viewport_left = dc + 1 - w;
         }
+    }
+}
+
+fn adjust(current: usize, delta: isize, cap: usize) -> usize {
+    if delta < 0 {
+        current.saturating_sub((-delta) as usize)
+    } else {
+        (current + delta as usize).min(cap)
     }
 }

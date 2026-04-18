@@ -5,6 +5,7 @@ mod app;
 mod clipboard;
 mod document;
 mod editor;
+mod parser;
 mod render;
 mod terminal;
 

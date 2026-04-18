@@ -5,7 +5,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::editor::Editor;
+use crate::editor::{Editor, RenderMode};
 
 pub fn draw(editor: &mut Editor, frame: &mut Frame) {
     let area = frame.area();
@@ -16,14 +16,21 @@ pub fn draw(editor: &mut Editor, frame: &mut Frame) {
     editor.viewport_height = content.height;
     editor.viewport_width = content.width;
     editor.content_area = content;
-    editor.scroll_to_cursor();
 
-    draw_content(editor, frame, content);
+    match editor.mode {
+        RenderMode::Raw => {
+            editor.scroll_to_cursor();
+            draw_raw(editor, frame, content);
+        }
+        RenderMode::Preview => draw_preview(editor, frame, content),
+    }
     draw_status(editor, frame, status);
-    place_cursor(editor, frame, content);
+    if matches!(editor.mode, RenderMode::Raw) {
+        place_cursor(editor, frame, content);
+    }
 }
 
-fn draw_content(editor: &Editor, frame: &mut Frame, area: Rect) {
+fn draw_raw(editor: &Editor, frame: &mut Frame, area: Rect) {
     let rope = &editor.document.rope;
     let top = editor.viewport_top;
     let left = editor.viewport_left;
@@ -88,16 +95,31 @@ fn draw_content(editor: &Editor, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_preview(editor: &mut Editor, frame: &mut Frame, area: Rect) {
+    let top = editor.preview_top;
+    let h = area.height as usize;
+    let preview = editor.preview_lines();
+    let slice: Vec<Line> = preview.iter().skip(top).take(h).cloned().collect();
+    frame.render_widget(Paragraph::new(slice), area);
+}
+
 fn draw_status(editor: &Editor, frame: &mut Frame, area: Rect) {
     let dirty_marker = if editor.document.dirty { "●" } else { " " };
     let name = editor.document.display_name();
-    let pos = format!("{}:{}", editor.cursor.line + 1, editor.cursor.col + 1);
+    let mode_label = match editor.mode {
+        RenderMode::Raw => "RAW",
+        RenderMode::Preview => "PREVIEW",
+    };
+    let pos = match editor.mode {
+        RenderMode::Raw => format!("{}:{}", editor.cursor.line + 1, editor.cursor.col + 1),
+        RenderMode::Preview => format!("line {}", editor.preview_top + 1),
+    };
     let status_text = editor.status.as_deref().unwrap_or("");
-    let left = format!(" {} {}  {}", dirty_marker, name, status_text);
-    let right = format!(" {} ", pos);
+    let left = format!(" [{mode_label}] {dirty_marker} {name}  {status_text}");
+    let right = format!(" {pos} ");
     let width = area.width as usize;
     let pad = width.saturating_sub(left.width() + right.width());
-    let line = format!("{}{}{}", left, " ".repeat(pad), right);
+    let line = format!("{left}{}{right}", " ".repeat(pad));
     let paragraph =
         Paragraph::new(line).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     frame.render_widget(paragraph, area);
