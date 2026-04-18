@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 mod app;
+mod clipboard;
 mod document;
 mod editor;
 mod render;

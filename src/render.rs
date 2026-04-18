@@ -1,6 +1,6 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -15,6 +15,7 @@ pub fn draw(editor: &mut Editor, frame: &mut Frame) {
 
     editor.viewport_height = content.height;
     editor.viewport_width = content.width;
+    editor.content_area = content;
     editor.scroll_to_cursor();
 
     draw_content(editor, frame, content);
@@ -28,6 +29,17 @@ fn draw_content(editor: &Editor, frame: &mut Frame, area: Rect) {
     let left = editor.viewport_left;
     let h = area.height as usize;
     let w = area.width as usize;
+    let sel_range = editor.selection_range();
+
+    let plain = Style::default();
+    let highlight = Style::default().add_modifier(Modifier::REVERSED);
+
+    let flush = |spans: &mut Vec<Span>, buf: &mut String, selected: bool| {
+        if !buf.is_empty() {
+            let style = if selected { highlight } else { plain };
+            spans.push(Span::styled(std::mem::take(buf), style));
+        }
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(h);
     for i in 0..h {
@@ -35,27 +47,43 @@ fn draw_content(editor: &Editor, frame: &mut Frame, area: Rect) {
         if ln >= rope.len_lines() {
             break;
         }
-        let mut out = String::new();
+        let line_start_char = rope.line_to_char(ln);
+        let mut spans: Vec<Span> = Vec::new();
+        let mut buf = String::new();
+        let mut buf_selected = false;
         let mut col = 0usize;
+        let mut char_idx = line_start_char;
+
         for ch in rope.line(ln).chars() {
             if ch == '\n' || ch == '\r' {
                 break;
             }
+            let selected = sel_range.as_ref().is_some_and(|r| r.contains(&char_idx));
             let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+
             if col >= left + w {
                 break;
             }
             if col >= left {
-                out.push(ch);
+                if selected != buf_selected {
+                    flush(&mut spans, &mut buf, buf_selected);
+                    buf_selected = selected;
+                }
+                buf.push(ch);
             } else if col + cw > left {
-                // Wide character straddling the left edge — pad with spaces.
+                if selected != buf_selected {
+                    flush(&mut spans, &mut buf, buf_selected);
+                    buf_selected = selected;
+                }
                 for _ in 0..(col + cw - left) {
-                    out.push(' ');
+                    buf.push(' ');
                 }
             }
             col += cw;
+            char_idx += 1;
         }
-        lines.push(Line::raw(out));
+        flush(&mut spans, &mut buf, buf_selected);
+        lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }

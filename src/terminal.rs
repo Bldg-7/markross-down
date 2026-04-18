@@ -1,5 +1,7 @@
 use anyhow::Result;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -13,7 +15,12 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 pub fn enter() -> Result<Tui> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     install_panic_hook();
     let backend = CrosstermBackend::new(out);
     let terminal = Terminal::new(backend)?;
@@ -24,8 +31,9 @@ pub fn leave(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
     Ok(())
@@ -35,7 +43,12 @@ fn install_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        let _ = execute!(
+            stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         hook(info);
     }));
 }

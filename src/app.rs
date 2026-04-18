@@ -2,7 +2,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use std::time::Duration;
 
-use crate::editor::input::key_to_action;
+use crate::editor::input::{key_to_action, mouse_to_action};
 use crate::editor::{ActionOutcome, Editor};
 use crate::render;
 use crate::terminal::Tui;
@@ -23,14 +23,24 @@ impl App {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if let Some(action) = key_to_action(key) {
-                            match self.editor.apply(action)? {
-                                ActionOutcome::Quit => return Ok(()),
-                                ActionOutcome::Saved | ActionOutcome::Continue => {}
+                            if let ActionOutcome::Quit = self.editor.apply(action)? {
+                                return Ok(());
                             }
                         }
                     }
-                    Event::Resize(_, _) => {}
-                    _ => {}
+                    Event::Mouse(mouse) => {
+                        let area = self.editor.content_area;
+                        if let Some(action) = mouse_to_action(mouse, area) {
+                            if let ActionOutcome::Quit = self.editor.apply(action)? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Event::Paste(text) => {
+                        self.editor.paste_text(&text);
+                    }
+                    Event::Resize(_, _) | Event::Key(_) | Event::FocusGained
+                    | Event::FocusLost => {}
                 }
             }
         }

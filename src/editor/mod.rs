@@ -2,19 +2,26 @@ pub mod cursor;
 pub mod input;
 
 use anyhow::Result;
+use ratatui::layout::Rect;
+use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
-use crate::document::Document;
+use crate::clipboard;
+use crate::document::{line_len_no_newline, Document};
 use cursor::Cursor;
-use input::Action;
+use input::{Action, Move};
 
 pub struct Editor {
     pub document: Document,
     pub cursor: Cursor,
+    /// Character offset where Shift- or mouse-anchored selection started.
+    /// `None` means no active selection.
+    pub selection_anchor: Option<usize>,
     pub viewport_top: usize,
     pub viewport_left: usize,
     pub viewport_height: u16,
     pub viewport_width: u16,
+    pub content_area: Rect,
     pub status: Option<String>,
 }
 
@@ -29,58 +36,69 @@ impl Editor {
         Self {
             document,
             cursor: Cursor::default(),
+            selection_anchor: None,
             viewport_top: 0,
             viewport_left: 0,
             viewport_height: 0,
             viewport_width: 0,
+            content_area: Rect::default(),
             status: None,
+        }
+    }
+
+    pub fn selection_range(&self) -> Option<Range<usize>> {
+        let anchor = self.selection_anchor?;
+        let total = self.document.rope.len_chars();
+        let anchor = anchor.min(total);
+        let head = self.cursor.char_offset(&self.document.rope).min(total);
+        if anchor == head {
+            None
+        } else if anchor < head {
+            Some(anchor..head)
+        } else {
+            Some(head..anchor)
         }
     }
 
     pub fn apply(&mut self, action: Action) -> Result<ActionOutcome> {
         self.status = None;
         match action {
-            Action::MoveLeft => self.cursor.move_left(&self.document.rope),
-            Action::MoveRight => self.cursor.move_right(&self.document.rope),
-            Action::MoveUp => self.cursor.move_up(&self.document.rope),
-            Action::MoveDown => self.cursor.move_down(&self.document.rope),
-            Action::MoveHome => self.cursor.move_home(),
-            Action::MoveEnd => self.cursor.move_end(&self.document.rope),
-            Action::MovePageUp => {
-                let step = self.viewport_height.max(1) as usize;
-                for _ in 0..step {
-                    self.cursor.move_up(&self.document.rope);
-                }
-            }
-            Action::MovePageDown => {
-                let step = self.viewport_height.max(1) as usize;
-                for _ in 0..step {
-                    self.cursor.move_down(&self.document.rope);
-                }
-            }
+            Action::Move(m, extend) => self.apply_move(m, extend),
             Action::InsertChar(c) => {
+                self.delete_selection();
                 let idx = self.cursor.char_offset(&self.document.rope);
                 self.document.insert_char(idx, c);
                 self.cursor.move_right(&self.document.rope);
+                self.selection_anchor = None;
             }
             Action::InsertNewline => {
+                self.delete_selection();
                 let idx = self.cursor.char_offset(&self.document.rope);
                 self.document.insert_char(idx, '\n');
                 self.cursor.line += 1;
                 self.cursor.col = 0;
                 self.cursor.desired_col = 0;
+                self.selection_anchor = None;
             }
             Action::Backspace => {
-                let idx = self.cursor.char_offset(&self.document.rope);
-                if idx > 0 {
-                    self.document.remove(idx - 1..idx);
-                    self.cursor.move_left(&self.document.rope);
+                if self.selection_range().is_some() {
+                    self.delete_selection();
+                } else {
+                    let idx = self.cursor.char_offset(&self.document.rope);
+                    if idx > 0 {
+                        self.document.remove(idx - 1..idx);
+                        self.cursor.move_left(&self.document.rope);
+                    }
                 }
             }
             Action::DeleteForward => {
-                let idx = self.cursor.char_offset(&self.document.rope);
-                if idx < self.document.rope.len_chars() {
-                    self.document.remove(idx..idx + 1);
+                if self.selection_range().is_some() {
+                    self.delete_selection();
+                } else {
+                    let idx = self.cursor.char_offset(&self.document.rope);
+                    if idx < self.document.rope.len_chars() {
+                        self.document.remove(idx..idx + 1);
+                    }
                 }
             }
             Action::Save => match self.document.save() {
@@ -93,9 +111,166 @@ impl Editor {
                 }
             },
             Action::Quit => return Ok(ActionOutcome::Quit),
+            Action::Copy => self.copy_selection_or_line(),
+            Action::Cut => self.cut_selection(),
+            Action::SelectAll => {
+                self.selection_anchor = Some(0);
+                let total_chars = self.document.rope.len_chars();
+                self.set_cursor_to_char_offset(total_chars);
+            }
+            Action::PasteHint => {
+                self.status = Some(
+                    "paste via terminal (Shift+Insert / Ctrl+Shift+V / Cmd+V)".to_string(),
+                );
+            }
+            Action::MouseDown(col, row) => self.handle_mouse_down(col, row),
+            Action::MouseDrag(col, row) => self.handle_mouse_drag(col, row),
+            Action::MouseUp => {}
+            Action::WheelUp => self.scroll_by(-3),
+            Action::WheelDown => self.scroll_by(3),
         }
         self.cursor.clamp(&self.document.rope);
         Ok(ActionOutcome::Continue)
+    }
+
+    pub fn paste_text(&mut self, text: &str) {
+        self.delete_selection();
+        let idx = self.cursor.char_offset(&self.document.rope);
+        self.document.rope.insert(idx, text);
+        self.document.dirty = true;
+        let inserted = text.chars().count();
+        self.set_cursor_to_char_offset(idx + inserted);
+        self.selection_anchor = None;
+        self.status = Some(format!("pasted {inserted} chars"));
+    }
+
+    fn apply_move(&mut self, m: Move, extend: bool) {
+        if extend {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor.char_offset(&self.document.rope));
+            }
+        } else {
+            self.selection_anchor = None;
+        }
+        match m {
+            Move::Left => self.cursor.move_left(&self.document.rope),
+            Move::Right => self.cursor.move_right(&self.document.rope),
+            Move::Up => self.cursor.move_up(&self.document.rope),
+            Move::Down => self.cursor.move_down(&self.document.rope),
+            Move::Home => self.cursor.move_home(),
+            Move::End => self.cursor.move_end(&self.document.rope),
+            Move::PageUp => {
+                let step = self.viewport_height.max(1) as usize;
+                for _ in 0..step {
+                    self.cursor.move_up(&self.document.rope);
+                }
+            }
+            Move::PageDown => {
+                let step = self.viewport_height.max(1) as usize;
+                for _ in 0..step {
+                    self.cursor.move_down(&self.document.rope);
+                }
+            }
+        }
+    }
+
+    fn delete_selection(&mut self) {
+        if let Some(range) = self.selection_range() {
+            self.document.remove(range.clone());
+            self.set_cursor_to_char_offset(range.start);
+            self.selection_anchor = None;
+        }
+    }
+
+    fn set_cursor_to_char_offset(&mut self, char_idx: usize) {
+        let rope = &self.document.rope;
+        let char_idx = char_idx.min(rope.len_chars());
+        let line = rope.char_to_line(char_idx);
+        let line_start = rope.line_to_char(line);
+        let col = char_idx - line_start;
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.desired_col = col;
+    }
+
+    fn copy_selection_or_line(&mut self) {
+        let text = match self.selection_range() {
+            Some(range) => self.document.rope.slice(range).to_string(),
+            None => self.document.rope.line(self.cursor.line).to_string(),
+        };
+        match clipboard::copy(&text) {
+            Ok(()) => {
+                self.status = Some(format!("copied {} chars", text.chars().count()));
+            }
+            Err(e) => {
+                self.status = Some(format!("copy failed: {e}"));
+            }
+        }
+    }
+
+    fn cut_selection(&mut self) {
+        let Some(range) = self.selection_range() else {
+            self.status = Some("nothing selected to cut".to_string());
+            return;
+        };
+        let text = self.document.rope.slice(range.clone()).to_string();
+        match clipboard::copy(&text) {
+            Ok(()) => {
+                let n = text.chars().count();
+                self.document.remove(range.clone());
+                self.set_cursor_to_char_offset(range.start);
+                self.selection_anchor = None;
+                self.status = Some(format!("cut {n} chars"));
+            }
+            Err(e) => {
+                self.status = Some(format!("cut failed: {e}"));
+            }
+        }
+    }
+
+    fn scroll_by(&mut self, delta: isize) {
+        let total = self.document.rope.len_lines();
+        let cap = total.saturating_sub(1);
+        self.viewport_top = if delta < 0 {
+            self.viewport_top.saturating_sub((-delta) as usize)
+        } else {
+            (self.viewport_top + delta as usize).min(cap)
+        };
+    }
+
+    fn handle_mouse_down(&mut self, col: u16, row: u16) {
+        let (line, column) = self.view_to_doc(col, row);
+        self.cursor.line = line;
+        self.cursor.col = column;
+        self.cursor.desired_col = column;
+        self.selection_anchor = Some(self.cursor.char_offset(&self.document.rope));
+    }
+
+    fn handle_mouse_drag(&mut self, col: u16, row: u16) {
+        let (line, column) = self.view_to_doc(col, row);
+        self.cursor.line = line;
+        self.cursor.col = column;
+        self.cursor.desired_col = column;
+    }
+
+    fn view_to_doc(&self, col: u16, row: u16) -> (usize, usize) {
+        let rope = &self.document.rope;
+        let total = rope.len_lines();
+        let raw_line = self.viewport_top + row as usize;
+        let line = raw_line.min(total.saturating_sub(1));
+        let target_col = self.viewport_left + col as usize;
+        let mut display = 0usize;
+        for (i, ch) in rope.line(line).chars().enumerate() {
+            if ch == '\n' || ch == '\r' {
+                return (line, i);
+            }
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if display + cw > target_col {
+                return (line, i);
+            }
+            display += cw;
+        }
+        (line, line_len_no_newline(rope, line))
     }
 
     pub fn cursor_display_col(&self) -> usize {
