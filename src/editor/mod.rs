@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::clipboard;
 use crate::document::{line_len_no_newline, Document};
 use crate::parser::{self, Block};
+use crate::plugin::{PluginHost, PluginOutput, PluginState};
 use crate::watcher::WatchEvent;
 use cursor::Cursor;
 use input::{Action, Move};
@@ -35,6 +36,7 @@ pub struct Editor {
     pub status: Option<String>,
     pub mode: RenderMode,
     pub pending_reload: Option<PendingReload>,
+    pub plugin_host: PluginHost,
     preview_cache: Option<Vec<Block>>,
 }
 
@@ -73,6 +75,7 @@ impl Editor {
             status: None,
             mode: RenderMode::Raw,
             pending_reload: None,
+            plugin_host: PluginHost::with_defaults(),
             preview_cache: None,
         }
     }
@@ -263,7 +266,7 @@ impl Editor {
     fn ensure_preview_cache(&mut self) {
         if self.preview_cache.is_none() {
             let text = self.document.rope.to_string();
-            self.preview_cache = Some(parser::render(&text));
+            self.preview_cache = Some(parser::render(&text, Some(&self.plugin_host)));
         }
     }
 
@@ -433,6 +436,70 @@ impl Editor {
     }
 }
 
+fn block_display_lines(editor: &Editor, block: &Block) -> Vec<Line<'static>> {
+    let Some(inv) = &block.plugin_invocation else {
+        return block.rendered_lines.clone();
+    };
+    match editor.plugin_host.query(&inv.plugin_name, &inv.content) {
+        PluginState::Ready(PluginOutput::Text(out)) => {
+            plugin_text_lines(&inv.plugin_name, &out)
+        }
+        PluginState::Ready(PluginOutput::Error(err)) => {
+            let mut lines = plugin_error_lines(&inv.plugin_name, &err);
+            lines.extend(block.rendered_lines.iter().cloned());
+            lines
+        }
+        PluginState::Pending => plugin_pending_lines(&inv.plugin_name),
+        PluginState::NotFound => block.rendered_lines.clone(),
+    }
+}
+
+fn plugin_text_lines(name: &str, text: &str) -> Vec<Line<'static>> {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::Span;
+    let header = Line::from(Span::styled(
+        format!("─── {name} output ──────────────"),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let body = text
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Green))));
+    let footer = Line::from(Span::styled(
+        "──────────────────────────".to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    std::iter::once(header).chain(body).chain(std::iter::once(footer)).collect()
+}
+
+fn plugin_error_lines(name: &str, err: &str) -> Vec<Line<'static>> {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::Span;
+    let mut lines = vec![Line::from(Span::styled(
+        format!("─── {name} error ───────────────"),
+        Style::default().fg(Color::Red),
+    ))];
+    for l in err.lines().take(3) {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "(falling back to raw source below)".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn plugin_pending_lines(name: &str) -> Vec<Line<'static>> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Span;
+    vec![Line::from(Span::styled(
+        format!("[{name}] rendering …"),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+    ))]
+}
+
 fn block_source_lines(editor: &Editor, block: &Block) -> Range<usize> {
     let rope = &editor.document.rope;
     let total = rope.len_lines();
@@ -487,8 +554,8 @@ fn build_preview_layout(editor: &Editor, blocks: &[Block]) -> PreviewLayout {
         if raw_fallback {
             emit_raw(src.clone(), &mut lines, &mut cursor_rendered_line);
         } else {
-            for l in &block.rendered_lines {
-                lines.push(l.clone());
+            for l in block_display_lines(editor, block) {
+                lines.push(l);
             }
         }
         prev_end = src.end;

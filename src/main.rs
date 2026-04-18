@@ -6,6 +6,7 @@ mod clipboard;
 mod document;
 mod editor;
 mod parser;
+mod plugin;
 mod render;
 mod terminal;
 mod watcher;

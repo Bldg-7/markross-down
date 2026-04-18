@@ -10,6 +10,8 @@ use std::ops::Range;
 use tui_big_text::{BigText, PixelSize};
 use unicode_width::UnicodeWidthStr;
 
+use crate::plugin::{PluginHost, PluginInvocation};
+
 /// A top-level Markdown block with its pre-rendered styled lines.
 pub struct Block {
     // id is reserved for future bitmap / plugin caches.
@@ -17,9 +19,13 @@ pub struct Block {
     pub id: u64,
     pub source_bytes: Range<usize>,
     pub rendered_lines: Vec<Line<'static>>,
+    /// If the block is a fenced code block whose language matches a registered
+    /// plugin trigger, this carries the invocation so render can substitute
+    /// the plugin's output for the raw code.
+    pub plugin_invocation: Option<PluginInvocation>,
 }
 
-pub fn render(markdown: &str) -> Vec<Block> {
+pub fn render(markdown: &str, host: Option<&PluginHost>) -> Vec<Block> {
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS;
@@ -34,11 +40,13 @@ pub fn render(markdown: &str) -> Vec<Block> {
             let start_byte = events[i].1.start;
             let end_byte = events[end_idx].1.end;
             let slice: Vec<(Event<'_>, Range<usize>)> = events[i..=end_idx].to_vec();
+            let plugin_invocation = extract_plugin_invocation(&slice, host);
             let rendered = render_events(slice);
             blocks.push(Block {
                 id: next_id,
                 source_bytes: start_byte..end_byte,
                 rendered_lines: rendered,
+                plugin_invocation,
             });
             next_id += 1;
             i = end_idx + 1;
@@ -51,6 +59,7 @@ pub fn render(markdown: &str) -> Vec<Block> {
                         "─".repeat(60),
                         Style::default().fg(Color::DarkGray),
                     ))],
+                    plugin_invocation: None,
                 });
                 next_id += 1;
             }
@@ -58,6 +67,28 @@ pub fn render(markdown: &str) -> Vec<Block> {
         }
     }
     blocks
+}
+
+fn extract_plugin_invocation(
+    events: &[(Event<'_>, Range<usize>)],
+    host: Option<&PluginHost>,
+) -> Option<PluginInvocation> {
+    let host = host?;
+    let (first, _) = events.first()?;
+    let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) = first else {
+        return None;
+    };
+    let plugin = host.find_by_trigger(lang.as_ref())?;
+    let mut content = String::new();
+    for (e, _) in events {
+        if let Event::Text(t) = e {
+            content.push_str(t.as_ref());
+        }
+    }
+    Some(PluginInvocation {
+        plugin_name: plugin.name.clone(),
+        content,
+    })
 }
 
 fn find_block_end(events: &[(Event<'_>, Range<usize>)], start: usize) -> Option<usize> {
