@@ -18,6 +18,7 @@ pulldown-cmark = { version = "0.12", default-features = false }
 notify = "7"
 notify-debouncer-full = "0.4"
 sha2 = "0.10"
+tui-big-text = "~0.7"
 
 [profile.release]
 lto = "thin"

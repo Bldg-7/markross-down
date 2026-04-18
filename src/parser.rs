@@ -1,15 +1,18 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Widget;
 use std::ops::Range;
+use tui_big_text::{BigText, PixelSize};
+use unicode_width::UnicodeWidthStr;
 
 /// A top-level Markdown block with its pre-rendered styled lines.
-///
-/// Blocks are the unit of raw-vs-styled mode switching: when the cursor (or
-/// an active selection) sits inside a block's `source_bytes`, the renderer
-/// shows that block as raw source; otherwise it uses `rendered_lines`.
 pub struct Block {
-    // id is unused in M4 but carried through for M6/M8 bitmap and plugin caching.
+    // id is reserved for future bitmap / plugin caches.
     #[allow(dead_code)]
     pub id: u64,
     pub source_bytes: Range<usize>,
@@ -110,7 +113,6 @@ fn is_block_tag_end(te: &TagEnd) -> bool {
     )
 }
 
-/// Render a single top-level block's events into styled lines.
 fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
@@ -119,6 +121,15 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
     let mut link_urls: Vec<String> = Vec::new();
     let mut line_prefix: Vec<Span<'static>> = Vec::new();
     let mut in_code_block = false;
+
+    // H1 accumulates plain text and is rendered via tui-big-text at End(Heading).
+    let mut big_heading: Option<(Color, String)> = None;
+
+    // Table state
+    let mut table_aligns: Vec<Alignment> = Vec::new();
+    let mut table_rows: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
+    let mut in_table_cell = false;
+    let mut current_cell: Vec<Span<'static>> = Vec::new();
 
     let flush = |current: &mut Vec<Span<'static>>,
                  prefix: &[Span<'static>],
@@ -131,15 +142,30 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
         out.push(Line::from(spans));
     };
 
+    let push_inline = |span: Span<'static>,
+                       in_table_cell: bool,
+                       current: &mut Vec<Span<'static>>,
+                       current_cell: &mut Vec<Span<'static>>| {
+        if in_table_cell {
+            current_cell.push(span);
+        } else {
+            current.push(span);
+        }
+    };
+
     for (event, _range) in events {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     flush(&mut current, &line_prefix, &mut out);
                     let (color, marker) = heading_style(level);
-                    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-                    style_stack.push(style);
-                    current.push(Span::styled(format!("{marker} "), style));
+                    if level == HeadingLevel::H1 {
+                        big_heading = Some((color, String::new()));
+                    } else {
+                        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                        style_stack.push(style);
+                        current.push(Span::styled(format!("{marker} "), style));
+                    }
                 }
                 Tag::Paragraph => {}
                 Tag::BlockQuote(_) => line_prefix.push(Span::styled(
@@ -196,20 +222,39 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                     let base = *style_stack.last().unwrap();
                     style_stack.push(base.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED));
                 }
-                Tag::Image { dest_url, .. } => current.push(Span::styled(
-                    format!("[image: {dest_url}]"),
-                    Style::default().fg(Color::Magenta),
-                )),
+                Tag::Image { dest_url, .. } => push_inline(
+                    Span::styled(
+                        format!("[image: {dest_url}]"),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                    in_table_cell,
+                    &mut current,
+                    &mut current_cell,
+                ),
+                Tag::Table(aligns) => {
+                    flush(&mut current, &line_prefix, &mut out);
+                    table_aligns = aligns.clone();
+                    table_rows.clear();
+                }
+                Tag::TableHead | Tag::TableRow => {
+                    table_rows.push(Vec::new());
+                }
+                Tag::TableCell => {
+                    in_table_cell = true;
+                    current_cell.clear();
+                }
                 _ => {}
             },
             Event::End(tag_end) => match tag_end {
                 TagEnd::Heading(_) => {
-                    style_stack.pop();
-                    flush(&mut current, &line_prefix, &mut out);
+                    if let Some((color, text)) = big_heading.take() {
+                        out.extend(render_big_heading(&text, color));
+                    } else {
+                        style_stack.pop();
+                        flush(&mut current, &line_prefix, &mut out);
+                    }
                 }
-                TagEnd::Paragraph => {
-                    flush(&mut current, &line_prefix, &mut out);
-                }
+                TagEnd::Paragraph => flush(&mut current, &line_prefix, &mut out),
                 TagEnd::BlockQuote(_) => {
                     line_prefix.pop();
                 }
@@ -224,24 +269,44 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                 TagEnd::List(_) => {
                     list_stack.pop();
                 }
-                TagEnd::Item => {
-                    flush(&mut current, &line_prefix, &mut out);
-                }
+                TagEnd::Item => flush(&mut current, &line_prefix, &mut out),
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     style_stack.pop();
                 }
                 TagEnd::Link => {
                     style_stack.pop();
                     if let Some(url) = link_urls.pop() {
-                        current.push(Span::styled(
-                            format!(" ({url})"),
-                            Style::default().fg(Color::DarkGray),
-                        ));
+                        push_inline(
+                            Span::styled(
+                                format!(" ({url})"),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            in_table_cell,
+                            &mut current,
+                            &mut current_cell,
+                        );
+                    }
+                }
+                TagEnd::Table => {
+                    let rendered = render_table(&table_rows, &table_aligns);
+                    out.extend(rendered);
+                    table_rows.clear();
+                    table_aligns.clear();
+                }
+                TagEnd::TableHead | TagEnd::TableRow => {}
+                TagEnd::TableCell => {
+                    in_table_cell = false;
+                    if let Some(row) = table_rows.last_mut() {
+                        row.push(std::mem::take(&mut current_cell));
                     }
                 }
                 _ => {}
             },
             Event::Text(t) => {
+                if let Some((_, ref mut acc)) = big_heading {
+                    acc.push_str(&t);
+                    continue;
+                }
                 let style = *style_stack.last().unwrap();
                 if in_code_block {
                     for segment in t.split_inclusive('\n') {
@@ -255,21 +320,194 @@ fn render_events(events: Vec<(Event<'_>, Range<usize>)>) -> Vec<Line<'static>> {
                         }
                     }
                 } else {
-                    current.push(Span::styled(t.into_string(), style));
+                    push_inline(
+                        Span::styled(t.into_string(), style),
+                        in_table_cell,
+                        &mut current,
+                        &mut current_cell,
+                    );
                 }
             }
-            Event::Code(c) => current.push(Span::styled(
-                c.into_string(),
-                Style::default().fg(Color::LightYellow),
-            )),
-            Event::SoftBreak => current.push(Span::raw(" ")),
-            Event::HardBreak => flush(&mut current, &line_prefix, &mut out),
+            Event::Code(c) => {
+                if big_heading.is_some() {
+                    continue;
+                }
+                push_inline(
+                    Span::styled(c.into_string(), Style::default().fg(Color::LightYellow)),
+                    in_table_cell,
+                    &mut current,
+                    &mut current_cell,
+                );
+            }
+            Event::SoftBreak => {
+                if big_heading.is_some() {
+                    continue;
+                }
+                push_inline(
+                    Span::raw(" "),
+                    in_table_cell,
+                    &mut current,
+                    &mut current_cell,
+                );
+            }
+            Event::HardBreak => {
+                if big_heading.is_some() {
+                    continue;
+                }
+                if !in_table_cell {
+                    flush(&mut current, &line_prefix, &mut out);
+                }
+            }
             _ => {}
         }
     }
 
     flush(&mut current, &line_prefix, &mut out);
     out
+}
+
+fn render_big_heading(text: &str, color: Color) -> Vec<Line<'static>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    // Quadrant pixel size: 4 cols x 4 rows per character.
+    let char_count = trimmed.chars().count();
+    let width = (char_count.saturating_mul(4).clamp(1, 240)) as u16;
+    let height: u16 = 4;
+    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let widget = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .style(style)
+        .lines(vec![Line::from(trimmed.to_string())])
+        .build();
+    widget_to_lines(widget, width, height)
+}
+
+fn widget_to_lines<W: Widget>(widget: W, width: u16, height: u16) -> Vec<Line<'static>> {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    widget.render(area, &mut buf);
+    let mut lines = Vec::with_capacity(height as usize);
+    for y in 0..height {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut text = String::new();
+        let mut current_style = Style::default();
+        let mut started = false;
+        for x in 0..width {
+            let Some(cell) = buf.cell((x, y)) else {
+                continue;
+            };
+            let style = Style::default()
+                .fg(cell.fg)
+                .bg(cell.bg)
+                .underline_color(cell.underline_color)
+                .add_modifier(cell.modifier);
+            if !started {
+                current_style = style;
+                started = true;
+            }
+            if style != current_style && !text.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut text), current_style));
+                current_style = style;
+            }
+            text.push_str(cell.symbol());
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, current_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn render_table(rows: &[Vec<Vec<Span<'static>>>], aligns: &[Alignment]) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols == 0 {
+        return Vec::new();
+    }
+    let mut widths = vec![0usize; cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            let w: usize = cell
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            if w > widths[i] {
+                widths[i] = w;
+            }
+        }
+    }
+    let border = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    lines.push(make_border(&widths, '┌', '┬', '┐', border));
+    for (idx, row) in rows.iter().enumerate() {
+        lines.push(make_row(row, &widths, aligns, border));
+        if idx == 0 && rows.len() > 1 {
+            lines.push(make_border(&widths, '├', '┼', '┤', border));
+        }
+    }
+    lines.push(make_border(&widths, '└', '┴', '┘', border));
+    lines
+}
+
+fn make_border(
+    widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+    style: Style,
+) -> Line<'static> {
+    let mut s = String::new();
+    s.push(left);
+    for (i, w) in widths.iter().enumerate() {
+        for _ in 0..(*w + 2) {
+            s.push('─');
+        }
+        if i + 1 < widths.len() {
+            s.push(mid);
+        }
+    }
+    s.push(right);
+    Line::from(Span::styled(s, style))
+}
+
+fn make_row(
+    row: &[Vec<Span<'static>>],
+    widths: &[usize],
+    aligns: &[Alignment],
+    border: Style,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled("│", border));
+    for (i, w) in widths.iter().enumerate() {
+        spans.push(Span::raw(" "));
+        let cell: Vec<Span<'static>> = row.get(i).cloned().unwrap_or_default();
+        let cell_width: usize = cell
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let align = aligns.get(i).copied().unwrap_or(Alignment::None);
+        let padding = w.saturating_sub(cell_width);
+        let (lpad, rpad) = match align {
+            Alignment::Right => (padding, 0),
+            Alignment::Center => (padding / 2, padding - padding / 2),
+            _ => (0, padding),
+        };
+        if lpad > 0 {
+            spans.push(Span::raw(" ".repeat(lpad)));
+        }
+        spans.extend(cell);
+        if rpad > 0 {
+            spans.push(Span::raw(" ".repeat(rpad)));
+        }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("│", border));
+    }
+    Line::from(spans)
 }
 
 enum ListKind {
