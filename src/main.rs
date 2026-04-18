@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 mod app;
 mod clipboard;
+mod config;
 mod document;
 mod editor;
 mod parser;
@@ -18,7 +19,20 @@ fn main() -> Result<()> {
         None => document::Document::empty(),
     };
 
-    let editor = editor::Editor::new(document);
+    let loaded = config::load();
+    let plugins = config::resolve_plugins(&loaded.config.plugins);
+    let host = plugin::PluginHost::new(plugins);
+
+    let mut editor = editor::Editor::new(document, host);
+    editor.status = match &loaded.source {
+        config::ConfigSource::File(p) => Some(format!("config: {}", p.display())),
+        config::ConfigSource::Defaults => None,
+        config::ConfigSource::Error { path, message } => Some(format!(
+            "config error at {}: {message} — using defaults",
+            path.display()
+        )),
+    };
+
     let watcher = editor
         .document
         .path

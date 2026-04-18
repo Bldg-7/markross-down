@@ -61,7 +61,7 @@ pub struct PreviewLayout {
 }
 
 impl Editor {
-    pub fn new(document: Document) -> Self {
+    pub fn new(document: Document, plugin_host: PluginHost) -> Self {
         Self {
             document,
             cursor: Cursor::default(),
@@ -75,7 +75,7 @@ impl Editor {
             status: None,
             mode: RenderMode::Raw,
             pending_reload: None,
-            plugin_host: PluginHost::with_defaults(),
+            plugin_host,
             preview_cache: None,
         }
     }

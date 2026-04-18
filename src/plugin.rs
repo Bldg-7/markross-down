@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -5,12 +6,13 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginDef {
     pub name: String,
     /// Fenced-code-block language (```<trigger>) that hands content to this plugin.
     pub trigger: String,
     pub command: String,
+    #[serde(default)]
     pub args: Vec<String>,
 }
 
@@ -47,10 +49,6 @@ pub struct PluginHost {
 }
 
 impl PluginHost {
-    pub fn with_defaults() -> Self {
-        Self::new(default_plugins())
-    }
-
     pub fn new(plugins: Vec<PluginDef>) -> Self {
         Self {
             plugins,
@@ -135,9 +133,9 @@ fn run(def: &PluginDef, content: &str) -> PluginOutput {
     }
 }
 
-/// Hardcoded plugin roster for M8. A later milestone adds TOML discovery from
-/// the user config directory (see DESIGN.md §4.5).
-fn default_plugins() -> Vec<PluginDef> {
+/// Built-in plugin roster used when the user's config file omits `[[plugins]]`
+/// or can't be loaded. User config entries override / extend this list.
+pub fn default_plugins() -> Vec<PluginDef> {
     vec![
         // Reference plugin: echoes stdin in uppercase. Requires `tr` (POSIX).
         // Use ```shout as the fence lang to trigger it.
