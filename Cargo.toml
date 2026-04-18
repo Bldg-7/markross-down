@@ -7,38 +7,11 @@ repository = "https://github.com/Bldg-7/markross-down"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# TUI
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
-ratatui-image = "4"
-
-# Document model
 ropey = "1.6"
-pulldown-cmark = "0.12"
-
-# File watching
-notify = "7"
-notify-debouncer-full = "0.4"
-similar = "2"
-
-# Bitmap rendering
-cosmic-text = "0.12"
-tiny-skia = "0.11"
-
-# Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "process", "time"] }
-futures = "0.3"
-
-# Clipboard fallback
-arboard = { version = "3", default-features = false }
-
-# Utilities
 anyhow = "1"
 thiserror = "2"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-sha2 = "0.10"
-directories = "5"
 unicode-width = "0.2"
 
 [profile.release]
